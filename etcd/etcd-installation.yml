@@ -1,0 +1,146 @@
+# ansible-playbook -i ../hosts.ini etcd-installation.yml -e 'ansible_ssh_common_args="-o StrictHostKeyChecking=no"'
+- name: ETCD installation
+  hosts: etcd_hosts
+  become: yes
+  any_errors_fatal: true
+
+  vars:
+    etcd_version: "3.5.15"
+    download_url: "https://github.com/etcd-io/etcd/releases/download/v{{ etcd_version }}/etcd-v{{ etcd_version }}-linux-amd64.tar.gz"
+    etcd_user: "scio"
+    etcd_group: "scio"
+    etcd_conf_dir: "/etc/etcd"
+    etcd_data_dir: "/var/lib/etcd"
+    etcd_conf_file: "{{ etcd_conf_dir }}/etcd.conf.yml"
+    etcd_service_file: "/etc/systemd/system/etcd.service"
+    etcd_install_dir: /opt/etcd
+    etcd_cluster: "etcd1=http://{{ hostvars['etcd1']['ansible_host'] }}:2380,etcd2=http://{{ hostvars['etcd2']['ansible_host'] }}:2380,etcd3=http://{{ hostvars['etcd3']['ansible_host'] }}:2380"
+
+  tasks:
+    - name: Run system updates
+      apt:
+        update_cache: yes
+        upgrade: dist
+        cache_valid_time: 3600
+    
+    - name: Install OS dependencies
+      apt:
+        name:
+          - acl
+          - wget
+        state: present
+        update_cache: yes
+
+    - name: Create scio group
+      group:
+        name: scio
+        state: present
+
+    - name: Create scio user
+      user:
+        name: scio
+        group: scio
+        create_home: yes
+        shell: /bin/bash
+
+    - name: Creating ETCD directory
+      ansible.builtin.file:
+        path: "{{ etcd_install_dir }}/releases/artifacts"
+        state: directory
+        
+    - name: Downloading ETCD
+      get_url:
+        url: "{{ download_url }}"
+        dest: "{{ etcd_install_dir }}/releases/artifacts/etcd-v{{ etcd_version }}-linux-amd64.tar.gz"
+
+    - name: Extracting ETCD tarball
+      unarchive:
+        src: "{{ etcd_install_dir }}/releases/artifacts/etcd-v{{ etcd_version }}-linux-amd64.tar.gz"
+        dest: "{{ etcd_install_dir }}/releases"    
+        remote_src: yes
+
+    - name: Move ETCD binary to /usr/local/bin
+      copy:
+        src: "{{ etcd_install_dir }}/releases/etcd-v{{ etcd_version }}-linux-amd64/etcd"
+        remote_src: yes
+        dest: /usr/local/bin/etcd
+        mode: '0755'
+
+    - name: Move etcdctl binary to /usr/local/bin
+      copy:
+        src: "{{ etcd_install_dir }}/releases/etcd-v{{ etcd_version }}-linux-amd64/etcdctl"
+        remote_src: yes
+        dest: /usr/local/bin/etcdctl
+        mode: '0755'
+
+    - name: Create configuration directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ etcd_user }}"
+        group: "{{ etcd_group }}"
+      with_items:
+        - "{{ etcd_conf_dir }}"
+        - "{{ etcd_data_dir }}"
+
+    - name: Create etcd configuration file
+      copy:
+        dest: "{{ etcd_conf_file }}"
+        content: |
+          data-dir: "{{ etcd_data_dir }}"
+          name: "{{ ansible_hostname }}"
+          initial-advertise-peer-urls: "http://{{ ansible_host }}:2380"
+          listen-peer-urls: "http://{{ ansible_host }}:2380"
+          advertise-client-urls: "http://{{ ansible_host }}:2379"
+          listen-client-urls: "http://{{ ansible_host }}:2379,http://127.0.0.1:2379"
+          initial-cluster: "{{ etcd_cluster }}"
+          initial-cluster-state: "new"
+          initial-cluster-token: "etcd-cluster"
+
+    - name: Create systemd service file for etcd
+      copy:
+        dest: "{{ etcd_service_file }}"
+        content: |
+          [Unit]
+          Description=etcd service
+          Documentation=https://github.com/etcd-io/etcd 
+          After=network.target
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          User={{ etcd_user }}
+          Type=notify
+          Environment="ETCD_OPTS=--config-file={{ etcd_conf_file }}"
+          ExecStart=/usr/local/bin/etcd $ETCD_OPTS
+          Restart=always
+          RestartSec=10s
+          LimitNOFILE=40000
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Reload systemd to apply new service
+      systemd:
+        daemon_reload: yes
+
+    - name: Start etcd service
+      systemd:
+        name: etcd
+        state: started
+        enabled: yes
+
+    - name: Check etcd service status
+      command: systemctl status etcd
+      register: etcd_status
+      failed_when: "'running' not in etcd_status.stdout"
+      changed_when: false
+
+    - name: Display etcd version
+      command: /usr/local/bin/etcd --version
+      register: etcd_version_output
+      changed_when: false
+      ignore_errors: yes
+
+    - debug:
+        msg: "{{ etcd_version_output.stdout }}"

@@ -1,0 +1,223 @@
+# ansible-playbook -i ../hosts.ini cluster.yml -e 'ansible_ssh_common_args="-o StrictHostKeyChecking=no"'
+---
+- name: Install stuff on all nodes
+  hosts: masters,workers
+  become: true
+  any_errors_fatal: true
+  vars:
+    kubernetes_version: "v1.31" # CHOOSE LATEST BEFORE RUNNING
+    user_name: "scio"
+  tasks:
+    - name: Update package cache
+      apt:
+        update_cache: yes
+    - name: Upgrade packages
+      apt:
+        upgrade: yes
+    - name: allow user to have passwordless sudo
+      lineinfile:
+        dest: /etc/sudoers
+        line: '{{ user_name }} ALL=(ALL) NOPASSWD: ALL'
+        validate: 'visudo -cf %s'
+    - name: set up authorized keys for the user
+      authorized_key: user={{ user_name }} key="{{item}}"
+      with_file:
+        - ~/.ssh/id_rsa.pub
+    - name: Necessary configuration for Kubernetes
+      ansible.builtin.shell: |
+        # Disable swap
+        sudo swapoff -a
+        sudo sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
+        sudo rm /swap.img
+        # Load kernel modules
+        sudo tee /etc/modules-load.d/containerd.conf <<EOF
+        overlay
+        br_netfilter
+        EOF
+        sudo modprobe overlay
+        sudo modprobe br_netfilter
+        # Set kernel parameters
+        sudo tee /etc/sysctl.d/kubernetes.conf <<EOT
+        net.bridge.bridge-nf-call-ip6tables = 1
+        net.bridge.bridge-nf-call-iptables = 1
+        net.ipv4.ip_forward = 1
+        EOT
+        # Apply changes
+        sudo sysctl --system
+    - name: Install containerd runtime
+      ansible.builtin.shell: |
+        sudo apt-get update
+        sudo apt-get install -y curl gnupg2 software-properties-common apt-transport-https ca-certificates
+        # Enable Docker repository
+        sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --yes --dearmour -o /etc/apt/trusted.gpg.d/docker.gpg
+        sudo add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" -y
+        # Install containerd
+        sudo apt-get update
+        sudo apt-get install -y containerd.io
+        # Configure containerd so it starts using systemd as cgroup
+        containerd config default | sudo tee /etc/containerd/config.toml >/dev/null 2>&1
+        sudo sed -i 's/SystemdCgroup \= false/SystemdCgroup \= true/g' /etc/containerd/config.toml
+        # Restart and enable containerd service
+        sudo systemctl restart containerd
+        sudo systemctl enable containerd
+    - name: Install Kubernetes
+      ansible.builtin.shell: |
+        curl -fsSL https://pkgs.k8s.io/core:/stable:/{{ kubernetes_version }}/deb/Release.key | sudo gpg --yes --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+        echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/{{ kubernetes_version }}/deb/ /' | sudo tee /etc/apt/sources.list.d/kubernetes.list
+        sudo apt-get update
+        sudo apt-get install -y kubelet kubeadm kubectl
+        sudo apt-mark hold kubelet kubeadm kubectl
+############################ Playbook can be run many times over up to here
+
+- name: Initialize cluster on first master
+  hosts: master1
+  vars:
+    haproxy_load_balancer: "192.168.73.200"
+  tasks:
+################################################### If external ETCD
+    - name: Create configuration file for kubeadm init
+      ansible.builtin.copy:
+        dest: ~/kubeadm-config.yml
+        content: |
+          apiVersion: kubeadm.k8s.io/v1beta4
+          kind: ClusterConfiguration
+          networking:
+            podSubnet: "10.244.0.0/16"
+          etcd:
+              external:
+                  endpoints:
+                  - http://{{ hostvars['etcd1']['ansible_host'] }}:2379
+                  - http://{{ hostvars['etcd2']['ansible_host'] }}:2379
+                  - http://{{ hostvars['etcd3']['ansible_host'] }}:2379
+          controlPlaneEndpoint: "{{ haproxy_load_balancer }}:6443"
+          ---
+          apiVersion: kubeadm.k8s.io/v1beta4
+          kind: InitConfiguration
+          localAPIEndpoint:
+            advertiseAddress: "{{ ansible_host }}"
+        mode: '0644'
+    - name: Initialize Kubernetes master node
+      ansible.builtin.shell: |
+        sudo kubeadm init --config ~/kubeadm-config.yml --upload-certs
+      register: kubeadm_init_output
+################################################### Else
+#     - name: Initialize Kubernetes master node
+#       ansible.builtin.shell: |
+#       sudo kubeadm init --pod-network-cidr=10.244.0.0/16 --control-plane-endpoint "{{ haproxy_load_balancer }}" --upload-certs
+#       register: kubeadm_init_output
+################################################### End if
+    - name: Extract join command in 3 parts
+      set_fact:
+        kubeadm_join_command_part1: "{{ (kubeadm_init_output.stdout_lines | select('search', 'kubeadm join') | list)[0] | regex_replace(' \\\\', '') | regex_replace('\t', '') }}"
+        kubeadm_join_command_part2: "{{ (kubeadm_init_output.stdout_lines | select('search', '--discovery-token-ca-cert-hash') | list)[0] | regex_replace(' \\\\', '') | regex_replace('\t', '') }}"
+        kubeadm_join_command_part3: "{{ (kubeadm_init_output.stdout_lines | select('search', '--control-plane --certificate-key') | list)[0] | regex_replace(' \\\\', '') | regex_replace('\t', '') }}"
+    - name: Combine join command parts
+      set_fact:
+        kubeadm_join_command_for_workers: "{{ kubeadm_join_command_part1 }} {{ kubeadm_join_command_part2 }}"
+        kubeadm_join_command_for_masters: "{{ kubeadm_join_command_part1 }} {{ kubeadm_join_command_part2 }} {{ kubeadm_join_command_part3 }}"
+    - name: Save join command for workers to local file so the next playbook can find it
+      delegate_to: localhost
+      local_action:
+        module: copy
+        content: "{{ kubeadm_join_command_for_workers }}"
+        dest: ./kubeadm_join_command_for_workers.txt
+    - name: Save join command for masters to local file so the next playbook can find it
+      delegate_to: localhost
+      local_action:
+        module: copy
+        content: "{{ kubeadm_join_command_for_masters }}"
+        dest: ./kubeadm_join_command_for_masters.txt
+    - name: Print kubeadm join command for workers
+      ansible.builtin.debug:
+        msg: "{{ kubeadm_join_command_for_workers }}"
+    - name: Print kubeadm join command for masters
+      ansible.builtin.debug:
+        msg: "{{ kubeadm_join_command_for_masters }}"
+    - name: Print kubeadm join command part 1
+      ansible.builtin.debug:
+        msg: "{{ kubeadm_join_command_part1 }}"
+    - name: Print kubeadm join command part 2
+      ansible.builtin.debug:
+        msg: "{{ kubeadm_join_command_part2 }}"
+    - name: Print kubeadm join command part 3
+      ansible.builtin.debug:
+        msg: "{{ kubeadm_join_command_part3 }}"
+
+- name: Join masters
+  hosts: master2,master3
+  tasks:
+    - name: Read the join command from local file
+      delegate_to: localhost
+      local_action:
+        module: slurp
+        src: ./kubeadm_join_command_for_masters.txt
+      register: join_command
+    - name: Decode the join command
+      set_fact:
+        kubeadm_join_command: "{{ join_command.content | b64decode }}"
+    - name: Join the Kubernetes cluster
+      ansible.builtin.shell: |
+        sudo {{ kubeadm_join_command }}
+
+- name: Enable kubectl command on other masters
+  hosts: masters
+  tasks:
+    - ansible.builtin.shell: |
+        mkdir -p $HOME/.kube
+        sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+        sudo chown $(id -u):$(id -g) $HOME/.kube/config
+
+- name: Join workers
+  hosts: workers
+  tasks:
+    - name: Read the join command from local file
+      delegate_to: localhost
+      local_action:
+        module: slurp
+        src: ./kubeadm_join_command_for_workers.txt
+      register: join_command
+    - name: Decode the join command
+      set_fact:
+        kubeadm_join_command: "{{ join_command.content | b64decode }}"
+    - name: Join the Kubernetes cluster
+      ansible.builtin.shell: |
+        sudo {{ kubeadm_join_command }}
+
+- name: Install Calico and MetalLB from other master to also verify it works
+  hosts: master2
+  tasks:
+    - name: Calico
+      ansible.builtin.shell: |
+        # Install Calico networking
+        kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.28.1/manifests/calico.yaml
+    - name: Create IPAddressPool configuration for MetalLB
+      ansible.builtin.copy:
+        dest: ~/metallb-IPAddressPool.yml
+        content: |
+          apiVersion: metallb.io/v1beta1
+          kind: IPAddressPool
+          metadata:
+            name: default-pool
+            namespace: metallb-system
+          spec:
+            addresses:
+            - 192.168.73.190-192.168.73.192
+        mode: '0644'
+    - name: Create L2Advertisement configuration for MetalLB
+      ansible.builtin.copy:
+        dest: ~/metallb-L2Advertisement.yml
+        content: |
+          apiVersion: metallb.io/v1beta1
+          kind: L2Advertisement
+          metadata:
+            name: default
+            namespace: metallb-system
+        mode: '0644'
+    - name: Install MetalLB
+      ansible.builtin.shell: |
+        kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/v0.14.5/config/manifests/metallb-native.yaml
+    - name: Apply MetalLB
+      ansible.builtin.shell: |
+        sleep 300
+        kubectl apply -f ~/metallb-IPAddressPool.yml
+        kubectl apply -f ~/metallb-L2Advertisement.yml
