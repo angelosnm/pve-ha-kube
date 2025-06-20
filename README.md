@@ -6,26 +6,6 @@ This project provides an automated pipeline for provisioning and deploying a ful
 
 The infrastructure setup leverages the [`Telmate/proxmox`](https://github.com/Telmate/terraform-provider-proxmox) Terraform provider, which requires a pre-existing VM template to be available on the Proxmox host. The system has been tested and verified on **Ubuntu 24.04**, using the official cloud-init image as the base template.
 
----
-
-## 📦 Project Structure
-
-```text
-├── ansible
-│   ├── etcd-installation.yml
-│   ├── haproxy-installation.yml
-│   ├── hosts.ini
-│   ├── kubeadm-config.yaml.j2
-│   ├── kubernetes-installation-playbook.yml
-│   ├── kubernetes-post-installation-playbook.yml
-│   ├── metallb-ipaddresspool.yaml.j2
-│   └── metallb-l2Advertisement.yaml
-├── README.md
-└── tf
-    ├── main.tf
-    ├── provider.tf
-    └── proxmox_env.tfvars.example
-```
 ## OpenTofu
 ```bash
 cd tf
