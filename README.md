@@ -1,3 +1,31 @@
+This project automates the provisioning and deployment of a highly available Kubernetes cluster using Terraform and Ansible. It is designed to run on a Proxmox virtualized environment and includes all the necessary infrastructure and configuration for setting up a production-like Kubernetes environment.
+
+The infrastructure setup leverages the Telmate/proxmox Terraform provider, which requires a pre-existing VM template on the Proxmox host. The system has been tested and verified on Ubuntu 24.04, using the official cloud-init image as the base template.
+
+This project provides an automated pipeline for provisioning and deploying a fully functional Kubernetes cluster on a **Proxmox** virtualized environment using **Terraform** and **Ansible**.
+
+The infrastructure setup leverages the [`Telmate/proxmox`](https://github.com/Telmate/terraform-provider-proxmox) Terraform provider, which requires a pre-existing VM template to be available on the Proxmox host. The system has been tested and verified on **Ubuntu 24.04**, using the official cloud-init image as the base template.
+
+---
+
+## 📦 Project Structure
+
+```text
+├── ansible
+│   ├── etcd-installation.yml
+│   ├── haproxy-installation.yml
+│   ├── hosts.ini
+│   ├── kubeadm-config.yaml.j2
+│   ├── kubernetes-installation-playbook.yml
+│   ├── kubernetes-post-installation-playbook.yml
+│   ├── metallb-ipaddresspool.yaml.j2
+│   └── metallb-l2Advertisement.yaml
+├── README.md
+└── tf
+    ├── main.tf
+    ├── provider.tf
+    └── proxmox_env.tfvars.example
+```
 ## OpenTofu
 ```bash
 cd tf
@@ -8,15 +36,6 @@ tofu apply -var-file="proxmox_env.tfvars"
 ```
 
 ## Ansible
-
-1. Set the host IPs in the Ansible inventory (`ansible/hosts.ini`)
-
-2. (If using username and password instead of SSH key to log in to hosts) Set up user and sudo password in the inventory.
-
-3. Run the 3 playbooks in order: etcd, haproxy and cluster.
-
-4. If you reset the Kubernetes cluster without resetting etcd, some nodes may need to be rebooted for the Calico pods to work, or they may not work at all.
-
 
 ```bash
 cd ansible
