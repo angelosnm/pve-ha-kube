@@ -1,0 +1,29 @@
+- name: Install Load Balancer (MetalLB)
+  hosts: kubernetes-control-plane-node-1
+  vars:
+    metallb_version: "0.14.9"
+    addresses: "{{ metallb_addresses }}"
+  tasks:
+    - name: Download MetalLB manifest
+      get_url:
+        url: https://raw.githubusercontent.com/metallb/metallb/v{{ metallb_version }}/config/manifests/metallb-native.yaml
+        dest: /tmp/metallb-native.yaml
+
+    - name: Apply MetalLB manifest
+      command: kubectl apply -f /tmp/metallb-native.yaml
+
+    - name: Render IPAddressPool config from template
+      template:
+        src: metallb-ipaddresspool.yaml.j2
+        dest: /tmp/metallb-ipaddresspool.yaml
+
+    - name: Apply IPAddressPool config
+      command: kubectl apply -f /tmp/metallb-ipaddresspool.yaml
+
+    - name: Render L2Advertisement config from template
+      template:
+        src: metallb-l2Advertisement.yaml
+        dest: /tmp/metallb-l2Advertisement.yaml
+
+    - name: Apply L2Advertisement config
+      command: kubectl apply -f /tmp/metallb-l2Advertisement.yaml

@@ -1,11 +1,10 @@
-# ansible-playbook -i ../hosts.ini etcd-installation.yml -e 'ansible_ssh_common_args="-o StrictHostKeyChecking=no"'
 - name: ETCD installation
-  hosts: etcd_hosts
+  hosts: etcd-nodes
   become: yes
   any_errors_fatal: true
 
   vars:
-    etcd_version: "3.5.15"
+    etcd_version: "3.5.21"
     download_url: "https://github.com/etcd-io/etcd/releases/download/v{{ etcd_version }}/etcd-v{{ etcd_version }}-linux-amd64.tar.gz"
     etcd_user: "scio"
     etcd_group: "scio"
@@ -14,7 +13,7 @@
     etcd_conf_file: "{{ etcd_conf_dir }}/etcd.conf.yml"
     etcd_service_file: "/etc/systemd/system/etcd.service"
     etcd_install_dir: /opt/etcd
-    etcd_cluster: "etcd1=http://{{ hostvars['etcd1']['ansible_host'] }}:2380,etcd2=http://{{ hostvars['etcd2']['ansible_host'] }}:2380,etcd3=http://{{ hostvars['etcd3']['ansible_host'] }}:2380"
+    etcd_cluster: "etcd-node-1=http://{{ hostvars['etcd-node-1']['ansible_host'] }}:2380,etcd-node-2=http://{{ hostvars['etcd-node-2']['ansible_host'] }}:2380,etcd-node-3=http://{{ hostvars['etcd-node-3']['ansible_host'] }}:2380"
 
   tasks:
     - name: Run system updates
@@ -30,18 +29,6 @@
           - wget
         state: present
         update_cache: yes
-
-    - name: Create scio group
-      group:
-        name: scio
-        state: present
-
-    - name: Create scio user
-      user:
-        name: scio
-        group: scio
-        create_home: yes
-        shell: /bin/bash
 
     - name: Creating ETCD directory
       ansible.builtin.file:
@@ -136,11 +123,11 @@
       failed_when: "'running' not in etcd_status.stdout"
       changed_when: false
 
-    - name: Display etcd version
-      command: /usr/local/bin/etcd --version
-      register: etcd_version_output
+    - name: Check etcd cluster health
+      command: etcdctl --endpoints=http://{{ hostvars['etcd-node-1']['ansible_host'] }}:2379,http://{{ hostvars['etcd-node-2']['ansible_host'] }}:2379,http://{{ hostvars['etcd-node-3']['ansible_host'] }}:2379 endpoint health
+      register: etcd_cluster_health_output
       changed_when: false
       ignore_errors: yes
 
     - debug:
-        msg: "{{ etcd_version_output.stdout }}"
+        msg: "{{ etcd_cluster_health_output.stdout }}"

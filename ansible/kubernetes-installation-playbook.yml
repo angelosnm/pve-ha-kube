@@ -1,0 +1,196 @@
+- name: Installation and configuration of dependencies
+  hosts: 
+    - kubernetes-control-plane-nodes
+    - kubernetes-worker-nodes
+  become: yes
+  any_errors_fatal: true
+  vars:
+    kubernetes_version: "1.33"
+    containerd_version: "2.0.5"
+    runc_version: "1.2.6"
+    cni_plugins_version: "1.6.2"
+  tasks:
+    - name: Update package cache
+      apt:
+        update_cache: yes
+    - name: Upgrade packages
+      apt:
+        upgrade: yes
+    - name: OS configuration for Kubernetes
+      ansible.builtin.shell: |
+        # Disable swap
+        sudo swapoff -a
+        sudo sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
+        sudo rm /swap.img
+        # Load kernel modules
+        sudo tee /etc/modules-load.d/containerd.conf <<EOF
+        overlay
+        br_netfilter
+        EOF
+        sudo modprobe overlay
+        sudo modprobe br_netfilter
+        # Set kernel parameters
+        sudo tee /etc/sysctl.d/kubernetes.conf <<EOT
+        net.bridge.bridge-nf-call-ip6tables = 1
+        net.bridge.bridge-nf-call-iptables = 1
+        net.ipv4.ip_forward = 1
+        EOT
+        # Apply changes
+        sudo sysctl --system
+
+    - name: Download containerd archive
+      get_url:
+        url: "https://github.com/containerd/containerd/releases/download/v{{ containerd_version }}/containerd-{{ containerd_version }}-linux-amd64.tar.gz"
+        dest: "/tmp/containerd.tar.gz"
+
+    - name: Extract containerd archive
+      unarchive:
+        src: "/tmp/containerd.tar.gz"
+        dest: "/tmp"
+        remote_src: yes
+
+    - name: Move containerd binaries to /usr/local/
+      command: mv /tmp/bin /usr/local/
+      args:
+        creates: /usr/local/bin/containerd
+
+    - name: Download containerd systemd service file
+      get_url:
+        url: "https://raw.githubusercontent.com/containerd/containerd/main/containerd.service"
+        dest: "/usr/lib/systemd/system/containerd.service"
+
+    - name: Reload systemd
+      systemd:
+        daemon_reload: yes
+
+    - name: Enable and start containerd
+      systemd:
+        name: containerd
+        enabled: yes
+        state: started
+
+    - name: Download runc binary
+      get_url:
+        url: "https://github.com/opencontainers/runc/releases/download/v{{ runc_version }}/runc.amd64"
+        dest: "/tmp/runc.amd64"
+        mode: '0755'
+
+    - name: Install runc
+      copy:
+        src: "/tmp/runc.amd64"
+        dest: "/usr/local/sbin/runc"
+        mode: '0755'
+        remote_src: yes
+
+    - name: Create CNI bin directory
+      file:
+        path: /opt/cni/bin
+        state: directory
+        mode: '0755'
+
+    - name: Download CNI plugins
+      get_url:
+        url: "https://github.com/containernetworking/plugins/releases/download/v{{ cni_plugins_version }}/cni-plugins-linux-amd64-v{{ cni_plugins_version }}.tgz"
+        dest: "/tmp/cni-plugins.tgz"
+
+    - name: Extract CNI plugins
+      unarchive:
+        src: "/tmp/cni-plugins.tgz"
+        dest: "/opt/cni/bin"
+        remote_src: yes
+
+    - name: Install Kubernetes
+      ansible.builtin.shell: |
+        curl -fsSL https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_version }}/deb/Release.key | sudo gpg --yes --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+        echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_version }}/deb/ /' | sudo tee /etc/apt/sources.list.d/kubernetes.list
+        sudo apt-get update
+        sudo apt-get install -y kubelet kubeadm kubectl
+        sudo apt-mark hold kubelet kubeadm kubectl
+
+- name: Initialize cluster on first control plane node
+  hosts: kubernetes-control-plane-node-1
+  become: yes
+  any_errors_fatal: true
+  vars:
+    control_plane_endpoint: "{{ haproxy_virtual_ip }}"
+    etcd_endpoints:
+      - "http://{{ hostvars['etcd-node-1']['ansible_host'] }}:2379"
+      - "http://{{ hostvars['etcd-node-2']['ansible_host'] }}:2379"
+      - "http://{{ hostvars['etcd-node-3']['ansible_host'] }}:2379"
+    pod_subnet: "10.244.0.0/16"
+    advertise_address: "{{ hostvars['kubernetes-control-plane-node-1'].ansible_host }}"
+    kubernetes_version: "1.33.0"
+  tasks:
+    - name: Render kubeadm config from template
+      template:
+        src: kubeadm-config.yaml.j2
+        dest: /tmp/kubeadm-config.yaml
+
+    - name: Initialize Kubernetes cluster
+      command: kubeadm init --config=/tmp/kubeadm-config.yaml --upload-certs
+      register: kubeadm_init_output
+
+    - name: Extract join commands
+      set_fact:
+        kubeadm_join_command_1: "{{ (kubeadm_init_output.stdout_lines | select('search', 'kubeadm join') | list)[0] | regex_replace(' \\\\', '') | regex_replace('\t', '') }}"
+        kubeadm_join_command_2: "{{ (kubeadm_init_output.stdout_lines | select('search', '--discovery-token-ca-cert-hash') | list)[0] | regex_replace(' \\\\', '') | regex_replace('\t', '') }}"
+        kubeadm_join_command_3: "{{ (kubeadm_init_output.stdout_lines | select('search', '--control-plane --certificate-key') | list)[0] | regex_replace(' \\\\', '') | regex_replace('\t', '') }}"
+
+    - name: Structure join commands
+      set_fact:
+        worker_join_command: "{{ kubeadm_join_command_1 }} {{ kubeadm_join_command_2 }}"
+        control_plane_join_command: "{{ kubeadm_join_command_1 }} {{ kubeadm_join_command_2 }} {{ kubeadm_join_command_3 }}"
+
+- name: Join additional control plane nodes
+  hosts:
+    - kubernetes-control-plane-node-2
+    - kubernetes-control-plane-node-3
+  become: yes
+  any_errors_fatal: true
+  vars:
+    join_command: "{{ hostvars['kubernetes-control-plane-node-1']['control_plane_join_command'] }}"
+  tasks:
+    - name: Join as control plane node
+      shell: "{{ join_command }} --v=5"
+      args:
+        creates: /etc/kubernetes/admin.conf
+
+- name: Enable kubectl command on control plane nodes
+  hosts: kubernetes-control-plane-nodes
+  tasks:
+    - ansible.builtin.shell: |
+        mkdir -p $HOME/.kube
+        sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+        sudo chown $(id -u):$(id -g) $HOME/.kube/config
+
+- name: Join worker nodes
+  hosts: kubernetes-worker-nodes
+  become: yes
+  any_errors_fatal: true
+  vars:
+    join_command: "{{ hostvars['kubernetes-control-plane-node-1']['worker_join_command'] }}"
+  tasks:
+    - name: Join as worker node
+      shell: "{{ join_command }} --v=5"
+
+- name: Install CNI (Calico)
+  hosts: kubernetes-control-plane-node-1
+  vars:
+    calico_version: "3.30.0"
+    pod_subnet: "10.244.0.0/16"
+  tasks:
+    - name: Download Calico manifest
+      get_url:
+        url: https://raw.githubusercontent.com/projectcalico/calico/v{{ calico_version }}/manifests/calico.yaml
+        dest: /tmp/calico.yaml
+
+    - name: Ammend default IP pool CIDR
+      replace:
+        path: /tmp/calico.yaml
+        regexp: '^(\s*)#\s*- name: CALICO_IPV4POOL_CIDR\s*\n\1#\s*value: ".*?"'
+        replace: |
+          \1- name: CALICO_IPV4POOL_CIDR
+          \1  value: "{{ pod_subnet }}"
+    
+    - name: Apply Calico manifest
+      command: kubectl apply -f /tmp/calico.yaml

@@ -1,0 +1,17 @@
+apiVersion: kubeadm.k8s.io/v1beta4
+kind: ClusterConfiguration
+kubernetesVersion: {{ kubernetes_version }}
+controlPlaneEndpoint: "{{ control_plane_endpoint }}"
+etcd:
+  external:
+    endpoints:
+    {% for endpoint in etcd_endpoints %}
+    - {{ endpoint }}
+    {% endfor %}
+networking:
+  podSubnet: "{{ pod_subnet }}"
+---
+apiVersion: kubeadm.k8s.io/v1beta4
+kind: InitConfiguration
+localAPIEndpoint:
+  advertiseAddress: "{{ advertise_address }}"
